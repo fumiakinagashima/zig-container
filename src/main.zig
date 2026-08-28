@@ -5,7 +5,7 @@ const SHM_KEY: i32 = 0x1234;
 
 var child_stack: [1024 * 1024]u8 align(16) = undefined;
 
-fn childMain(parent_shmid: usize) callconv(.c) u8 {
+fn childMain(rootfs_ptr: usize) callconv(.c) u8 {
     std.debug.print("[child] pid inside new PID namespace: {d}\n", .{sys.getPid()});
     
     sys.setHostname("zig-container") catch |err| {
@@ -29,15 +29,38 @@ fn childMain(parent_shmid: usize) callconv(.c) u8 {
         );
     } else |err| {
         std.debug.print(
-            "[child] shmget lookup for the same key failed as expected: {s} (parent's shmid was {d}, but this IPC namespace has no such segment)\n",
-            .{ @errorName(err), parent_shmid },
+            "[child] shmget lookup for the same key failed as expected: {s} (this IPC namespace has no such segment)\n",
+            .{ @errorName(err)},
         );
     }
 
-    return 0;
+    const rootfs: [*:0]const u8 = @ptrFromInt(rootfs_ptr);
+    sys.pivotRootInto(rootfs) catch |err| {
+        std.debug.print(
+            "[child] pivot_root into {s} failed: {s}\n",
+            .{std.mem.span(rootfs), @errorName(err)},
+        );
+        return 1;
+    };
+    std.debug.print("[child] pivot_root done, root filesystem is now {s}\n", .{std.mem.span(rootfs)});
+
+    sys.mountProc() catch |err| {
+        std.debug.print("[child] mounting /proc failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
+    std.debug.print("[child] handing over to /bin/sh\n", .{});
+
+    const shell_argv = [_:null]?[*:0]const u8{"/bin/sh"};
+    const shell_envp = [_:null]?[*:0]const u8{"PATH=/bin"};
+    sys.execInto("/bin/sh", &shell_argv, &shell_envp) catch |err| {
+        std.debug.print("[child] execve failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    unreachable;
 }
 
-fn runInNewNamespace() !void {
+fn runInNewNamespace(rootfs: [:0]const u8) !void {
     std.debug.print("[parent] pid: {d}\n", .{sys.getPid()});
 
     const parent_shmid = try sys.shmGet(SHM_KEY, 4096, sys.IPC_CREAT | 0o600);
@@ -47,10 +70,10 @@ fn runInNewNamespace() !void {
     );
 
     const child_pid = sys.cloneInNamespace(
-        sys.CLONE_NEWPID | sys.CLONE_NEWUTS | sys.CLONE_NEWIPC,
+        sys.CLONE_NEWPID | sys.CLONE_NEWUTS | sys.CLONE_NEWIPC | sys.CLONE_NEWNS,
         &child_stack,
         childMain,
-        @intCast(parent_shmid),
+        @intFromPtr(rootfs.ptr),
     ) catch |err| {
         std.debug.print(
             "clone failed (try running with sudo): {s}\n",
@@ -64,7 +87,7 @@ fn runInNewNamespace() !void {
     );
 
     const exit_status = try sys.waitForChild(child_pid);
-    std.debug.print("[parent] shild exited with status: {d}\n", .{exit_status});
+    std.debug.print("[parent] child exited with status: {d}\n", .{exit_status});
 
     const uts = try sys.getUname();
     std.debug.print(
@@ -81,15 +104,10 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     
-    if (args.len < 2) {
-        std.debug.print("usage: {s} <command>\n", .{args[0]});
+    if (args.len < 3 or !std.mem.eql(u8, args[1], "run")) {
+        std.debug.print("usage: {s} run <rootfs-path>\n", .{args[0]});
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "run")) {
-        try runInNewNamespace();
-        return;
-    }
-
-    std.debug.print("Unknown command: {s}\n", .{args[1]});
+    try runInNewNamespace(args[2]);
 }

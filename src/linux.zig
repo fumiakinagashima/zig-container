@@ -81,3 +81,28 @@ pub fn shmRemove(shmid: i32) SyscallError!void {
     const rc = linux.syscall3(.shmctl, @intCast(shmid), IPC_RMID, 0);
     try check("shmctl", rc);
 }
+
+pub const CLONE_NEWNS: u32 = 0x00020000;
+
+pub fn pivotRootInto(new_root: [*:0]const u8) SyscallError!void {
+    try check("mount(private)", linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0));
+    try check("mount(bind)", linux.mount(new_root, new_root, null, linux.MS.BIND | linux.MS.REC, 0));
+    try check("chdir(new_root)", linux.chdir(new_root));
+    try check("mkdir(put_old)", linux.mkdir("put_old", 0o700));
+    try check("pivot_root", linux.pivot_root(".", "put_old"));
+    try check("chdir(/)", linux.chdir("/"));
+    try check("umount2(put_old)", linux.umount2("/put_old", linux.MNT.DETACH));
+    try check("rmdir(put_old)", linux.rmdir("/put_old"));
+}
+
+pub fn mountProc() SyscallError!void {
+    try check("mount(proc)", linux.mount("proc", "/proc", "proc", 0, 0));
+}
+
+pub fn execInto(
+    path: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+) SyscallError!void {
+    try check("execve", linux.execve(path, argv, envp));
+}
