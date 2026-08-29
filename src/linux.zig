@@ -189,3 +189,17 @@ pub fn installSeccompFilter(prog: *const anyopaque) SyscallError!void {
     try check("seccomp", linux.seccomp(linux.SECCOMP.SET_MODE_FILTER, 0, prog));
 }
 
+pub fn changeDir(path: [*:0]const u8) SyscallError!void {
+    try check("chdir", linux.chdir(path));
+}
+
+pub fn readFile(path: [*:0]const u8, buf: []u8) SyscallError![]u8 {
+    const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    try check("open", fd_rc);
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    const n = try readFd(fd, buf);
+
+    return buf[0..n];
+}

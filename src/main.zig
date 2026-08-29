@@ -4,15 +4,16 @@ const Cgroup = @import("cgroup.zig").Cgroup;
 const Netlink = @import("netlink.zig").NetlinkSocket;
 const capabilities = @import("capabilities.zig");
 const seccomp = @import("seccomp.zig");
+const oci_config = @import("oci_config.zig");
 
 const SHM_KEY: i32 = 0x1234;
-const MEMORY_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
-const CPU_QUOTA_US: u64 = 50_000;
-const CPU_PERIOD_US: u64 = 100_000;
-
 const HOST_VETH_ADDR = [4]u8{ 10, 200, 0, 1 };
 const CONTAINER_VETH_ADDR = [4]u8{ 10, 200, 0, 2 };
 const VETH_PREFIX_LEN: u8 = 24;
+
+const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_CPU_QUOTA_US: u64 = 50_000;
+const DEFAULT_CPU_PERIOD_US: u64 = 100_000;
 
 var child_stack: [1024 * 1024]u8 align(16) = undefined;
 
@@ -20,14 +21,30 @@ const ChildContext = struct {
     rootfs: [*:0]const u8,
     sync_read_fd: i32,
     peer_veth_name: [*:0]const u8,
+    hostname: []const u8,
+    cwd: [*:0]const u8,
+    program: [*:0]const u8,
+    argv: [:null]const ?[*:0]const u8,
+    envp: [:null]const ?[*:0]const u8,
 };
+
+fn buildCStringArray(
+    allocator: std.mem.Allocator,
+    items: [][]const u8,
+) ![:null]?[*:0]const u8 {
+    const array = try allocator.allocSentinel(?[*:0]const u8, items.len, null);
+    for (items, 0..) |item, i| {
+        array[i] = try allocator.dupeZ(u8, item);
+    }
+    return array;
+}
 
 fn childMain(ctx_ptr: usize) callconv(.c) u8 {
     const ctx: *const ChildContext = @ptrFromInt(ctx_ptr);
 
     std.debug.print("[child] pid inside new PID namespace: {d}\n", .{sys.getPid()});
     
-    sys.setHostname("zig-container") catch |err| {
+    sys.setHostname(ctx.hostname) catch |err| {
         std.debug.print("[child] setHostname failed: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -116,6 +133,14 @@ fn childMain(ctx_ptr: usize) callconv(.c) u8 {
         return 1;
     };
 
+    sys.changeDir(ctx.cwd) catch |err| {
+        std.debug.print(
+            "[child] chdir to {s} failed: {s}\n",
+            .{ std.mem.span(ctx.cwd), @errorName(err) }
+        );
+        return 1;
+    };
+
     capabilities.dropToMinimalSet() catch |err| {
         std.debug.print("[child] dropping capabilities failed: {s}\n", .{@errorName(err)});
         return 1;
@@ -128,11 +153,8 @@ fn childMain(ctx_ptr: usize) callconv(.c) u8 {
     };
     std.debug.print("[child] seccomp filter installed (mount blocked)\n", .{});
 
-    std.debug.print("[child] handing over to /bin/sh\n", .{});
-
-    const shell_argv = [_:null]?[*:0]const u8{"/bin/sh"};
-    const shell_envp = [_:null]?[*:0]const u8{"PATH=/bin"};
-    sys.execInto("/bin/sh", &shell_argv, &shell_envp) catch |err| {
+    std.debug.print("[child] handing over to {s}\n", .{std.mem.span(ctx.program)});
+    sys.execInto(ctx.program, ctx.argv, ctx.envp) catch |err| {
         std.debug.print("[child] execve failed: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -149,18 +171,35 @@ fn setupHostNetwork(host_name: []const u8, peer_name: []const u8, child_pid: i32
     try netlink.addAddress(host_name, HOST_VETH_ADDR, VETH_PREFIX_LEN);
 }
 
-fn runInNewNamespace(allocator: std.mem.Allocator, rootfs: [:0]const u8) !void {
+fn runInNewNamespace(allocator: std.mem.Allocator, bundle_dir: []const u8) !void {
     std.debug.print("[parent] pid: {d}\n", .{sys.getPid()});
+
+    const config = try oci_config.loadFromBundle(allocator, bundle_dir);
+    if (config.process.args.len == 0) return error.EmptyProcessArgs;
+
+    const rootfs = try oci_config.resolveRootfsPath(allocator, bundle_dir, config);
+    const argv = try buildCStringArray(allocator, config.process.args);
+    const envp = try buildCStringArray(allocator, config.process.env);
+    const cwd = try std.fmt.allocPrintSentinel(allocator, "{s}", .{config.process.cwd}, 0);
+    const program = argv[0].?;
+
+    std.debug.print(
+        "[parent] loaded bundle: rootfs={s}, process={s}, hostname={s}\n",
+        .{ rootfs, program, config.hostname },
+    );
 
     const cgroup_name = try std.fmt.allocPrint(allocator, "zigcon-{d}", .{sys.getPid()});
     const cgroup = try Cgroup.create(allocator, cgroup_name);
     defer cgroup.destroy();
 
-    try cgroup.setMemoryMax(MEMORY_LIMIT_BYTES);
-    try cgroup.setCpuMax(CPU_QUOTA_US, CPU_PERIOD_US);
+    const memory_limit = config.linux.resources.memory.limit orelse DEFAULT_MEMORY_LIMIT_BYTES;
+    const cpu_quota = config.linux.resources.cpu.quota orelse DEFAULT_CPU_QUOTA_US;
+    const cpu_period = config.linux.resources.cpu.period orelse DEFAULT_CPU_PERIOD_US;
+    try cgroup.setMemoryMax(memory_limit);
+    try cgroup.setCpuMax(cpu_quota, cpu_period);
     std.debug.print(
         "[parent] created cgroup {s} (memory<={d}MiB, cpu<={d}%)\n",
-        .{cgroup.path, MEMORY_LIMIT_BYTES / 1024 / 1024, CPU_QUOTA_US * 100 / CPU_PERIOD_US},
+        .{cgroup.path, memory_limit / 1024 / 1024, cpu_quota * 100 / cpu_period },
     );
 
     const parent_shmid = try sys.shmGet(SHM_KEY, 4096, sys.IPC_CREAT | 0o600);
@@ -177,6 +216,11 @@ fn runInNewNamespace(allocator: std.mem.Allocator, rootfs: [:0]const u8) !void {
         .rootfs = rootfs.ptr,
         .sync_read_fd = sync_pipe[0],
         .peer_veth_name = peer_veth_name.ptr,
+        .hostname = config.hostname,
+        .cwd = cwd.ptr,
+        .program = program,
+        .argv = argv,
+        .envp = envp,
     };
 
     const child_pid = sys.cloneInNamespace(
@@ -240,7 +284,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
     
     if (args.len < 3 or !std.mem.eql(u8, args[1], "run")) {
-        std.debug.print("usage: {s} run <rootfs-path>\n", .{args[0]});
+        std.debug.print("usage: {s} run <bundle-dir>\n", .{args[0]});
         return;
     }
 

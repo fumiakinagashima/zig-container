@@ -1,0 +1,18 @@
+{                                                                 
+    "ociVersion": "1.0.2",                                                                             
+    "hostname": "zig-container",
+    "process": {
+        "args": ["/bin/echo", "hello from config.json"],
+        "env": ["PATH=/bin"],
+        "cwd": "/"
+    },
+    "root": {
+        "path": "rootfs"
+    },
+    "linux": {
+        "resources": {
+            "memory": { "limit": 104857600 },
+            "cpu": { "quota": 50000, "period": 100000 }
+        } 
+    }
+}
