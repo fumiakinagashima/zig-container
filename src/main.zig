@@ -1,7 +1,11 @@
 const std = @import("std");
 const sys = @import("linux.zig");
+const Cgroup = @import("cgroup.zig").Cgroup;
 
 const SHM_KEY: i32 = 0x1234;
+const MEMORY_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+const CPU_QUOTA_US: u64 = 50_000;
+const CPU_PERIOD_US: u64 = 100_000;
 
 var child_stack: [1024 * 1024]u8 align(16) = undefined;
 
@@ -60,8 +64,19 @@ fn childMain(rootfs_ptr: usize) callconv(.c) u8 {
     unreachable;
 }
 
-fn runInNewNamespace(rootfs: [:0]const u8) !void {
+fn runInNewNamespace(allocator: std.mem.Allocator, rootfs: [:0]const u8) !void {
     std.debug.print("[parent] pid: {d}\n", .{sys.getPid()});
+
+    const cgroup_name = try std.fmt.allocPrint(allocator, "zigcon-{d}", .{sys.getPid()});
+    const cgroup = try Cgroup.create(allocator, cgroup_name);
+    defer cgroup.destroy();
+
+    try cgroup.setMemoryMax(MEMORY_LIMIT_BYTES);
+    try cgroup.setCpuMax(CPU_QUOTA_US, CPU_PERIOD_US);
+    std.debug.print(
+        "[parent] created cgroup {s} (memory<={d}MiB, cpu<={d}%)\n",
+        .{cgroup.path, MEMORY_LIMIT_BYTES / 1024 / 1024, CPU_QUOTA_US * 100 / CPU_PERIOD_US},
+    );
 
     const parent_shmid = try sys.shmGet(SHM_KEY, 4096, sys.IPC_CREAT | 0o600);
     std.debug.print(
@@ -86,6 +101,9 @@ fn runInNewNamespace(rootfs: [:0]const u8) !void {
         .{child_pid},
     );
 
+    try cgroup.addProcess(child_pid);
+    std.debug.print("[parent] moved child pid {d} into cgroup {s}\n", .{child_pid, cgroup.path});
+
     const exit_status = try sys.waitForChild(child_pid);
     std.debug.print("[parent] child exited with status: {d}\n", .{exit_status});
 
@@ -109,5 +127,5 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    try runInNewNamespace(args[2]);
+    try runInNewNamespace(allocator, args[2]);
 }

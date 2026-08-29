@@ -106,3 +106,19 @@ pub fn execInto(
 ) SyscallError!void {
     try check("execve", linux.execve(path, argv, envp));
 }
+
+pub fn makeDir(path: [*:0]const u8, mode: u32) SyscallError!void {
+    try check("mkdir", linux.mkdir(path, mode));
+}
+
+pub fn removeDir(path: [*:0]const u8) SyscallError!void {
+    try check("rmdir", linux.rmdir(path));
+}
+
+pub fn writeFile(path: [*:0]const u8, data: []const u8) SyscallError!void {
+    const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY }, 0)    ;
+    try check("open", fd_rc);
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+    try check("write", linux.write(fd, data.ptr, data.len));
+}
