@@ -5,6 +5,7 @@ const Netlink = @import("netlink.zig").NetlinkSocket;
 const capabilities = @import("capabilities.zig");
 const seccomp = @import("seccomp.zig");
 const oci_config = @import("oci_config.zig");
+const oci_registry = @import("oci_registry.zig");
 
 const SHM_KEY: i32 = 0x1234;
 const HOST_VETH_ADDR = [4]u8{ 10, 200, 0, 1 };
@@ -279,14 +280,45 @@ fn runInNewNamespace(allocator: std.mem.Allocator, bundle_dir: []const u8) !void
 
 }
 
+fn pullImage(allocator: std.mem.Allocator, io: std.Io, image_ref: []const u8) !void {
+    const sep = std.mem.lastIndexOfScalar(u8, image_ref, ':') orelse return error.InvalidImageRef;
+    const repository = image_ref[0..sep];
+    const reference = image_ref[sep + 1 ..];
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const manifest = try oci_registry.pullManifest(allocator, &client, repository, reference);
+    std.debug.print(
+        "config: {s} ({d} bytes, {s})\n",
+        .{ manifest.config.digest, manifest.config.size, manifest.config.mediaType },
+    );
+
+    for (manifest.layers, 0..) |layer, i| {
+        std.debug.print(
+            "layer[{d}]: {s} ({d} bytes, {s})\n",
+            .{ i, layer.digest, layer.size, layer.mediaType },
+        );
+    }
+}
+
+const USAGE = "usage: {s} run <bundle-dir> | pull <repository>:<reference>\n";
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     
-    if (args.len < 3 or !std.mem.eql(u8, args[1], "run")) {
-        std.debug.print("usage: {s} run <bundle-dir>\n", .{args[0]});
+    if (args.len < 3) {
+        std.debug.print(USAGE, .{args[0]});
         return;
     }
 
-    try runInNewNamespace(allocator, args[2]);
+    if (std.mem.eql(u8, args[1], "run")) {
+        return runInNewNamespace(allocator, args[2]);
+    }
+    if (std.mem.eql(u8, args[1], "pull")) {
+        return pullImage(allocator, init.io, args[2]);
+    }
+
+    std.debug.print(USAGE, .{args[0]});
 }
