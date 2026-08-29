@@ -36,6 +36,8 @@ pub fn setHostname(name: []const u8) SyscallError!void {
 pub const CLONE_NEWPID: u32 = 0x20000000;
 pub const CLONE_NEWUTS: u32 = 0x04000000;
 pub const CLONE_NEWIPC: u32 = 0x08000000;
+pub const CLONE_NEWNS: u32 = 0x00020000;
+pub const CLONE_NEWNET: u32 = 0x40000000;
 
 pub const IPC_CREAT: u32 = 0o1000;
 pub const IPC_RMID: u32 = 0;
@@ -82,8 +84,6 @@ pub fn shmRemove(shmid: i32) SyscallError!void {
     try check("shmctl", rc);
 }
 
-pub const CLONE_NEWNS: u32 = 0x00020000;
-
 pub fn pivotRootInto(new_root: [*:0]const u8) SyscallError!void {
     try check("mount(private)", linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0));
     try check("mount(bind)", linux.mount(new_root, new_root, null, linux.MS.BIND | linux.MS.REC, 0));
@@ -121,4 +121,49 @@ pub fn writeFile(path: [*:0]const u8, data: []const u8) SyscallError!void {
     const fd: i32 = @intCast(fd_rc);
     defer _ = linux.close(fd);
     try check("write", linux.write(fd, data.ptr, data.len));
+}
+
+pub fn readFd(fd: i32, buf: []u8) SyscallError!usize {
+    const rc = linux.read(fd, buf.ptr, buf.len);
+    try check("read", rc);
+    return rc;
+}
+
+pub fn writeFd(fd: i32, data: []const u8) SyscallError!usize {
+    const rc = linux.write(fd, data.ptr, data.len);
+    try check("write", rc);
+    return rc;
+}
+
+pub fn closeFd(fd: i32) void {
+    _ = linux.close(fd);
+}
+
+pub fn createPipe() SyscallError![2]i32 {
+    var fds: [2]i32 = undefined;
+    try check("pipe2", linux.pipe2(&fds, .{}));
+    return fds;
+}
+
+pub fn createNetlinkSocket() SyscallError!i32 {
+    const rc = linux.socket(linux.AF.NETLINK, linux.SOCK.RAW, linux.NETLINK.ROUTE);
+    try check("socket", rc);
+    const fd: i32 = @intCast(rc);
+
+    const addr = linux.sockaddr.nl{ .pid = 0, .groups = 0 };
+    try check("bind", linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.nl)));
+    
+    return fd;
+}
+
+pub fn sendNetlink(fd: i32, data: []const u8) SyscallError!void {
+    const dest = linux.sockaddr.nl{ .pid = 0, .groups = 0 };
+    const rc = linux.sendto(fd, data.ptr, data.len, 0, @ptrCast(&dest), @sizeOf(linux.sockaddr.nl));
+    try check("sendto", rc);
+}
+
+pub fn recvNetlink(fd: i32, buf: []u8) SyscallError!usize {
+    const rc = linux.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
+    try check("recvfrom", rc);
+    return rc;
 }

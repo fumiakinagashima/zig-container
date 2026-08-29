@@ -1,15 +1,28 @@
 const std = @import("std");
 const sys = @import("linux.zig");
 const Cgroup = @import("cgroup.zig").Cgroup;
+const Netlink = @import("netlink.zig").NetlinkSocket;
 
 const SHM_KEY: i32 = 0x1234;
 const MEMORY_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 const CPU_QUOTA_US: u64 = 50_000;
 const CPU_PERIOD_US: u64 = 100_000;
 
+const HOST_VETH_ADDR = [4]u8{ 10, 200, 0, 1 };
+const CONTAINER_VETH_ADDR = [4]u8{ 10, 200, 0, 2 };
+const VETH_PREFIX_LEN: u8 = 24;
+
 var child_stack: [1024 * 1024]u8 align(16) = undefined;
 
-fn childMain(rootfs_ptr: usize) callconv(.c) u8 {
+const ChildContext = struct {
+    rootfs: [*:0]const u8,
+    sync_read_fd: i32,
+    peer_veth_name: [*:0]const u8,
+};
+
+fn childMain(ctx_ptr: usize) callconv(.c) u8 {
+    const ctx: *const ChildContext = @ptrFromInt(ctx_ptr);
+
     std.debug.print("[child] pid inside new PID namespace: {d}\n", .{sys.getPid()});
     
     sys.setHostname("zig-container") catch |err| {
@@ -38,7 +51,55 @@ fn childMain(rootfs_ptr: usize) callconv(.c) u8 {
         );
     }
 
-    const rootfs: [*:0]const u8 = @ptrFromInt(rootfs_ptr);
+    var sync_byte: [1]u8 = undefined;
+    _ = sys.readFd(ctx.sync_read_fd, &sync_byte) catch |err| {
+        std.debug.print(
+            "[child] waiting for network setup failed: {s}\n",
+            .{@errorName(err),
+        });
+        return 1;
+    };
+    sys.closeFd(ctx.sync_read_fd);
+
+    const peer_name = std.mem.span(ctx.peer_veth_name);
+
+    var netlink = Netlink.open() catch |err| {
+        std.debug.print("[child] netlink open failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer netlink.close();
+
+    netlink.setLinkUp(peer_name) catch |err| {
+        std.debug.print(
+            "[child] bringing up {s} failed: {s}\n",
+            .{ peer_name, @errorName(err)},
+        );
+        return 1;
+    };
+    netlink.addAddress(peer_name, CONTAINER_VETH_ADDR, VETH_PREFIX_LEN) catch |err| {
+        std.debug.print("[child] assigning address to {s} failed: {s}\n", .{ peer_name, @errorName(err) });
+        return 1;
+    };
+    netlink.setLinkUp("lo") catch |err| {
+        std.debug.print(
+            "[child] bringing up lo failed: {s}\n",
+            .{@errorName(err)},
+        );
+        return 1;
+    };
+    std.debug.print(
+        "[child] {s} = {d}.{d}.{d}.{d}/{d}, lo up\n",
+        .{
+            peer_name,
+            CONTAINER_VETH_ADDR[0],
+            CONTAINER_VETH_ADDR[1],
+            CONTAINER_VETH_ADDR[2],
+            CONTAINER_VETH_ADDR[3],
+            VETH_PREFIX_LEN,
+        }
+    );
+
+    const rootfs = ctx.rootfs;
     sys.pivotRootInto(rootfs) catch |err| {
         std.debug.print(
             "[child] pivot_root into {s} failed: {s}\n",
@@ -64,6 +125,16 @@ fn childMain(rootfs_ptr: usize) callconv(.c) u8 {
     unreachable;
 }
 
+fn setupHostNetwork(host_name: []const u8, peer_name: []const u8, child_pid: i32) !void {
+    var netlink = try Netlink.open();
+    defer netlink.close();
+
+    try netlink.createVethPair(host_name, peer_name);
+    try netlink.moveToNetns(peer_name, child_pid);
+    try netlink.setLinkUp(host_name);
+    try netlink.addAddress(host_name, HOST_VETH_ADDR, VETH_PREFIX_LEN);
+}
+
 fn runInNewNamespace(allocator: std.mem.Allocator, rootfs: [:0]const u8) !void {
     std.debug.print("[parent] pid: {d}\n", .{sys.getPid()});
 
@@ -84,11 +155,21 @@ fn runInNewNamespace(allocator: std.mem.Allocator, rootfs: [:0]const u8) !void {
         .{parent_shmid},
     );
 
+    const host_veth_name = try std.fmt.allocPrintSentinel(allocator, "veth-h{d}", .{sys.getPid()}, 0);
+    const peer_veth_name = try std.fmt.allocPrintSentinel(allocator, "veth-c{d}", .{sys.getPid()}, 0);
+    const sync_pipe = try sys.createPipe();
+
+    var child_ctx = ChildContext{
+        .rootfs = rootfs.ptr,
+        .sync_read_fd = sync_pipe[0],
+        .peer_veth_name = peer_veth_name.ptr,
+    };
+
     const child_pid = sys.cloneInNamespace(
-        sys.CLONE_NEWPID | sys.CLONE_NEWUTS | sys.CLONE_NEWIPC | sys.CLONE_NEWNS,
+        sys.CLONE_NEWPID | sys.CLONE_NEWUTS | sys.CLONE_NEWIPC | sys.CLONE_NEWNS | sys.CLONE_NEWNET,
         &child_stack,
         childMain,
-        @intFromPtr(rootfs.ptr),
+        @intFromPtr(&child_ctx),
     ) catch |err| {
         std.debug.print(
             "clone failed (try running with sudo): {s}\n",
@@ -100,6 +181,28 @@ fn runInNewNamespace(allocator: std.mem.Allocator, rootfs: [:0]const u8) !void {
         "[parent] child pid (as seen from parent's namespace): {d}\n",
         .{child_pid},
     );
+
+    setupHostNetwork(host_veth_name, peer_veth_name, child_pid) catch |err| {
+        std.debug.print(
+            "[parent] network setup failed: {s}\n",
+            .{@errorName(err)},
+        );
+    };
+    std.debug.print(
+        "[parent] host veth {s} = {d}.{d}.{d}.{d}/{d}, peer {s} moved into child's netns\n",
+        .{
+            host_veth_name, 
+            HOST_VETH_ADDR[0],
+            HOST_VETH_ADDR[1],
+            HOST_VETH_ADDR[2],
+            HOST_VETH_ADDR[3],
+            VETH_PREFIX_LEN,
+            peer_veth_name,
+        },
+    );
+
+    _ = try sys.writeFd(sync_pipe[1], "x");
+    sys.closeFd(sync_pipe[1]);
 
     try cgroup.addProcess(child_pid);
     std.debug.print("[parent] moved child pid {d} into cgroup {s}\n", .{child_pid, cgroup.path});
