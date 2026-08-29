@@ -2,6 +2,8 @@ const std = @import("std");
 const sys = @import("linux.zig");
 const Cgroup = @import("cgroup.zig").Cgroup;
 const Netlink = @import("netlink.zig").NetlinkSocket;
+const capabilities = @import("capabilities.zig");
+const seccomp = @import("seccomp.zig");
 
 const SHM_KEY: i32 = 0x1234;
 const MEMORY_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
@@ -113,6 +115,18 @@ fn childMain(ctx_ptr: usize) callconv(.c) u8 {
         std.debug.print("[child] mounting /proc failed: {s}\n", .{@errorName(err)});
         return 1;
     };
+
+    capabilities.dropToMinimalSet() catch |err| {
+        std.debug.print("[child] dropping capabilities failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    std.debug.print("[child] capabilities reduced to Docker-default set\n", .{});
+
+    seccomp.blockMount() catch |err| {
+        std.debug.print("[child] installing seccomp filter failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    std.debug.print("[child] seccomp filter installed (mount blocked)\n", .{});
 
     std.debug.print("[child] handing over to /bin/sh\n", .{});
 

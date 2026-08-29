@@ -167,3 +167,25 @@ pub fn recvNetlink(fd: i32, buf: []u8) SyscallError!usize {
     try check("recvfrom", rc);
     return rc;
 }
+
+pub fn prctl(
+    option: i32,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+    arg5: usize,
+) SyscallError!void {
+    try check("prctl", linux.prctl(option, arg2, arg3, arg4, arg5));
+}
+
+pub fn setCapabilities(
+    hdrp: *linux.cap_user_header_t,
+    datap: *const linux.cap_user_data_t,
+) SyscallError!void {
+    try check("capset", linux.capset(hdrp, datap));
+}
+
+pub fn installSeccompFilter(prog: *const anyopaque) SyscallError!void {
+    try check("seccomp", linux.seccomp(linux.SECCOMP.SET_MODE_FILTER, 0, prog));
+}
+
