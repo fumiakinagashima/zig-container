@@ -3,7 +3,8 @@
   "hostname": "zigcon",
   "process": {
     "args": [
-      "/bin/sh"
+      "/bin/sleep",
+      "300"
     ],
     "env": [
       "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

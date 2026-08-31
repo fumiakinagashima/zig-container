@@ -1,7 +1,7 @@
 const std = @import("std");
 const sys = @import("linux.zig");
 
-const cgroup_root = "/sys/fs/cgroup";
+pub const cgroup_root = "/sys/fs/cgroup";
 
 pub const Cgroup = struct {
     allocator: std.mem.Allocator,

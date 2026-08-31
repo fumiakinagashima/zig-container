@@ -203,3 +203,62 @@ pub fn readFile(path: [*:0]const u8, buf: []u8) SyscallError![]u8 {
 
     return buf[0..n];
 }
+
+pub fn makeFifo(path: [*:0]const u8, mode: u32) SyscallError!void {
+    try check("mknod", linux.mknod(path, linux.S.IFIFO | mode, 0));
+}
+
+pub fn removeFile(path: [*:0]const u8) SyscallError!void {
+    try check("unlink", linux.unlink(path));
+}
+
+pub fn openForReading(path: [*:0]const u8) SyscallError!i32 {
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    try check("open", rc);
+    return @intCast(rc);
+}
+
+pub fn openForWriting(path: [*:0]const u8) SyscallError!i32 {
+    const rc = linux.open(path, .{ .ACCMODE = .WRONLY }, 0);
+    try check("open", rc);
+    return @intCast(rc);
+}
+
+pub fn sendSignal(pid: linux.pid_t, sig: u32) SyscallError!void {
+    try check("kill", linux.kill(pid, @enumFromInt(sig)));
+}
+
+pub fn processExists(pid: linux.pid_t) bool {
+    const rc = linux.kill(pid, @enumFromInt(@as(u32, 0)));
+    return linux.errno(rc) != .SRCH;
+}
+
+pub fn openPath(path: [*:0]const u8) SyscallError!i32 {
+    const rc = linux.open(path, .{ .PATH = true }, 0);
+    try check("open", rc);
+    return @intCast(rc);
+}
+
+pub fn newSession() SyscallError!void {
+    try check("setsid", linux.setsid());
+}
+
+pub fn detachStdio() SyscallError!void {
+    const fd_rc = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    try check("open", fd_rc);
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    try check("dup2", linux.dup2(fd, 0));
+    try check("dup2", linux.dup2(fd, 1));
+    try check("dup2", linux.dup2(fd, 2));
+}
+
+pub fn mountTmpfs(target: [*:0]const u8) SyscallError!void {
+    try check("mount(tmpfs)", linux.mount("tmpfs", target, "tmpfs", linux.MS.NOSUID, @intFromPtr("mode=755".ptr)));
+}
+
+pub fn makeCharDevice(path: [*:0]const u8, mode: u32, major: u32, minor: u32) SyscallError!void {
+    const dev: u32 = (major << 8) | minor;
+    try check("mknod", linux.mknod(path, linux.S.IFCHR | mode, dev));
+}

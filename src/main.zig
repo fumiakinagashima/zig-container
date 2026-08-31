@@ -1,12 +1,14 @@
 const std = @import("std");
 const sys = @import("linux.zig");
 const Cgroup = @import("cgroup.zig").Cgroup;
+const CGROUP_ROOT = @import("cgroup.zig").cgroup_root;
 const Netlink = @import("netlink.zig").NetlinkSocket;
 const capabilities = @import("capabilities.zig");
 const seccomp = @import("seccomp.zig");
 const oci_config = @import("oci_config.zig");
 const oci_registry = @import("oci_registry.zig");
 const oci_image = @import("oci_image.zig");
+const lifecycle = @import("lifecycle.zig");
 
 const SHM_KEY: i32 = 0x1234;
 const HOST_VETH_ADDR = [4]u8{ 10, 200, 0, 1 };
@@ -28,6 +30,8 @@ const ChildContext = struct {
     program: [*:0]const u8,
     argv: [:null]const ?[*:0]const u8,
     envp: [:null]const ?[*:0]const u8,
+    ready_write_fd: ?i32 = null,
+    exec_fifo_path: ?[*:0]const u8 = null,
 };
 
 fn buildCStringArray(
@@ -41,8 +45,36 @@ fn buildCStringArray(
     return array;
 }
 
+const DevNode = struct {
+    path: [*:0]const u8,
+    major: u32,
+    minor: u32,
+};
+const DEV_NODES = [_]DevNode {
+    .{ .path = "/dev/null", .major = 1, .minor = 3 },
+    .{ .path = "/dev/zero", .major = 1, .minor = 5 },
+    .{ .path = "/dev/full", .major = 1, .minor = 7 },
+    .{ .path = "/dev/random", .major = 1, .minor = 8 },
+    .{ .path = "/dev/urandom", .major = 1, .minor = 9 },
+    .{ .path = "/dev/tty", .major = 5, .minor = 0 },
+};
+
+fn setupMinimalDev() !void {
+    try sys.mountTmpfs("/dev");
+    for (DEV_NODES) |node| {
+        try sys.makeCharDevice(node.path, 0o666, node.major, node.minor);
+    }
+}
+
 fn childMain(ctx_ptr: usize) callconv(.c) u8 {
     const ctx: *const ChildContext = @ptrFromInt(ctx_ptr);
+
+    if (ctx.exec_fifo_path != null) {
+        sys.newSession() catch |err| {
+            std.debug.print("[child] setsid failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+    }
 
     std.debug.print("[child] pid inside new PID namespace: {d}\n", .{sys.getPid()});
     
@@ -108,6 +140,7 @@ fn childMain(ctx_ptr: usize) callconv(.c) u8 {
         );
         return 1;
     };
+
     std.debug.print(
         "[child] {s} = {d}.{d}.{d}.{d}/{d}, lo up\n",
         .{
@@ -119,6 +152,14 @@ fn childMain(ctx_ptr: usize) callconv(.c) u8 {
             VETH_PREFIX_LEN,
         }
     );
+
+    var exec_fifo_path_fd: ?i32 = null;
+    if (ctx.exec_fifo_path) |fifo_path| {
+        exec_fifo_path_fd = sys.openPath(fifo_path) catch |err| {
+            std.debug.print("[child] opening exec fifo path failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+    }
 
     const rootfs = ctx.rootfs;
     sys.pivotRootInto(rootfs) catch |err| {
@@ -134,6 +175,12 @@ fn childMain(ctx_ptr: usize) callconv(.c) u8 {
         std.debug.print("[child] mounting /proc failed: {s}\n", .{@errorName(err)});
         return 1;
     };
+
+    setupMinimalDev() catch |err| {
+        std.debug.print("[child] setting up /dev failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    std.debug.print("[child] minimal /dev populated (null, zero, full, random, urandom, tty)\n", .{});
 
     sys.changeDir(ctx.cwd) catch |err| {
         std.debug.print(
@@ -154,6 +201,41 @@ fn childMain(ctx_ptr: usize) callconv(.c) u8 {
         return 1;
     };
     std.debug.print("[child] seccomp filter installed (mount blocked)\n", .{});
+
+    if (ctx.ready_write_fd) |fd| {
+        _ = sys.writeFd(fd, "x") catch |err| {
+            std.debug.print("[child] signaling ready failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        sys.closeFd(fd);
+    }
+
+    if (ctx.exec_fifo_path != null) {
+        sys.detachStdio() catch |err| {
+            std.debug.print("[child] detaching stdio failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+    }
+
+    if (exec_fifo_path_fd) |path_fd| {
+        std.debug.print("[child] waiting for start signal on exec fifo\n", .{});
+
+        var proc_fd_path_buf: [32]u8 = undefined;
+        const proc_fd_path = std.fmt.bufPrintZ(&proc_fd_path_buf, "/proc/self/fd/{d}", .{path_fd}) catch unreachable;
+
+        const fifo_fd = sys.openForReading(proc_fd_path) catch |err| {
+            std.debug.print("[child] opening exec fifo failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        sys.closeFd(path_fd);
+        
+        var start_byte: [1]u8 = undefined;
+        _ = sys.readFd(fifo_fd, &start_byte) catch |err| {
+            std.debug.print("[child] reading exec fifo failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        sys.closeFd(fifo_fd);
+    }
 
     std.debug.print("[child] handing over to {s}\n", .{std.mem.span(ctx.program)});
     sys.execInto(ctx.program, ctx.argv, ctx.envp) catch |err| {
@@ -281,6 +363,161 @@ fn runInNewNamespace(allocator: std.mem.Allocator, bundle_dir: []const u8) !void
 
 }
 
+fn createContainer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    id: []const u8,
+    bundle_dir: []const u8,
+) !void {
+    if (id.len > 9) return error.ContainerIdTooLong;
+
+    const config = try oci_config.loadFromBundle(allocator, bundle_dir);
+    if (config.process.args.len == 0) return error.EmptyProcessArgs;
+
+    const rootfs = try oci_config.resolveRootfsPath(allocator, bundle_dir, config);
+    const argv = try buildCStringArray(allocator, config.process.args);
+    const envp = try buildCStringArray(allocator, config.process.env);
+    const cwd = try std.fmt.allocPrintSentinel(allocator, "{s}", .{config.process.cwd}, 0);
+    const program = argv[0].?;
+
+    std.debug.print(
+        "[parent] creating container {s}: rootfs={s}, process={s}\n",
+        .{ id, rootfs, program },
+    );
+
+    const state_dir = try lifecycle.stateDir(allocator, id);
+    const state_dir_handle = try std.Io.Dir.cwd().createDirPathOpen(io, state_dir, .{});
+    state_dir_handle.close(io);
+
+    const exec_fifo_path = try lifecycle.execFifoPath(allocator, id);
+    try sys.makeFifo(exec_fifo_path, 0o600);
+
+    const cgroup_name = try std.fmt.allocPrint(allocator, "zigcon-{s}", .{id});
+    const cgroup = try Cgroup.create(allocator, cgroup_name);
+    const memory_limit = config.linux.resources.memory.limit orelse DEFAULT_MEMORY_LIMIT_BYTES;
+    const cpu_quota = config.linux.resources.cpu.quota orelse DEFAULT_CPU_QUOTA_US;
+    const cpu_period = config.linux.resources.cpu.period orelse DEFAULT_CPU_PERIOD_US;
+    try cgroup.setMemoryMax(memory_limit);
+    try cgroup.setCpuMax(cpu_quota, cpu_period);
+
+    const host_veth_name = try std.fmt.allocPrintSentinel(allocator, "veth-h{s}", .{id}, 0);
+    const peer_veth_name = try std.fmt.allocPrintSentinel(allocator, "veth-c{s}", .{id}, 0);
+    const sync_pipe = try sys.createPipe();
+    const ready_pipe = try sys.createPipe();
+
+    var child_ctx = ChildContext{
+        .rootfs = rootfs.ptr,
+        .sync_read_fd = sync_pipe[0],
+        .peer_veth_name = peer_veth_name.ptr,
+        .hostname = config.hostname,
+        .cwd = cwd.ptr,
+        .program = program,
+        .argv = argv,
+        .envp = envp,
+        .ready_write_fd = ready_pipe[1],
+        .exec_fifo_path = exec_fifo_path.ptr,
+    };
+
+    const child_pid = try sys.cloneInNamespace(
+        sys.CLONE_NEWPID | sys.CLONE_NEWUTS | sys.CLONE_NEWIPC | sys.CLONE_NEWNS | sys.CLONE_NEWNET,
+        &child_stack,
+        childMain,
+        @intFromPtr(&child_ctx),
+    );
+    std.debug.print("[parent] child pid: {d}\n", .{child_pid});
+
+    sys.closeFd(sync_pipe[0]);
+    sys.closeFd(ready_pipe[1]);
+
+    try setupHostNetwork(host_veth_name, peer_veth_name, child_pid);
+
+    _ = try sys.writeFd(sync_pipe[1], "x");
+    sys.closeFd(sync_pipe[1]);
+
+    try cgroup.addProcess(child_pid);
+
+    var ready_byte: [1]u8 = undefined;
+    const ready_len = try sys.readFd(ready_pipe[0], &ready_byte);
+    sys.closeFd(ready_pipe[0]);
+    if (ready_len == 0) return error.ContainerInitFailed;
+
+    try lifecycle.save(allocator, io, .{
+        .id = id,
+        .pid = child_pid,
+        .bundle = bundle_dir,
+        .status = .created,
+    });
+    std.debug.print("[parent] container {s} created (pid={d})\n", .{ id, child_pid });
+}   
+
+fn startContainer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    id: []const u8
+) !void {
+    var state = try lifecycle.load(allocator, io, id);
+    if (state.status != .created) return error.ContainerNotCreated;
+
+    const exec_fifo_path = try lifecycle.execFifoPath(allocator, id);
+    const fifo_fd = try sys.openForWriting(exec_fifo_path);
+    _ = try sys.writeFd(fifo_fd, "x");
+    sys.closeFd(fifo_fd);
+
+    state.status = .running;
+    try lifecycle.save(allocator, io, state);
+    std.debug.print("[parent] container {s} started\n", .{id});
+}
+
+fn killContainer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    id: []const u8,
+    signal: u32
+) !void {
+    const state = try lifecycle.load(allocator, io, id);
+    try sys.sendSignal(state.pid, signal);
+    std.debug.print(
+        "[parent] sent signal {d} to container {s} (pid={d})\n",
+        .{ signal, id, state.pid }
+    );
+}
+
+fn stateContainer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    id: []const u8
+) !void {
+    var state = try lifecycle.load(allocator, io, id);
+    if (!sys.processExists(state.pid)) state.status = .stopped;
+
+    std.debug.print(
+        "id={s} pid={d} bundle={s} status={s}\n",
+        .{ state.id, state.pid, state.bundle, @tagName(state.status) },
+    );
+}
+
+fn deleteContainer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    id: []const u8
+) !void {
+    const state = try lifecycle.load(allocator, io, id);
+    if (sys.processExists(state.pid)) return error.ContainerStillRunning;
+
+    const cgroup_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/zigcon-{s}",
+        .{CGROUP_ROOT, id},
+        0,
+    );
+    (Cgroup{ .allocator = allocator, .path = cgroup_path }).destroy();
+    
+    const state_dir = try lifecycle.stateDir(allocator, id);
+    try std.Io.Dir.cwd().deleteTree(io, state_dir);
+
+    std.debug.print("[parent] container {s} deleted\n", .{id});
+}
+
 fn pullImage(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -318,7 +555,7 @@ fn pullImage(
     std.debug.print("bundle ready: {s}\n", .{bundle_dir});
 }
 
-const USAGE = "usage: {s} run <bundle-dir> | pull <repository>:<reference>\n";
+const USAGE = "usage: {s} run <bundle-dir> | pull <repository>:<reference> | create <id> <bundle-dir> | start <id> | kill <id> [signal] | state <id> | delete <id>\n";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -334,6 +571,26 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, args[1], "pull")) {
         return pullImage(allocator, init.io, args[2]);
+    }
+    if (std.mem.eql(u8, args[1], "create")) {
+        if (args.len < 4) {
+            std.debug.print(USAGE, .{args[0]});
+            return;
+        }
+        return createContainer(allocator, init.io, args[2], args[3]);
+    }
+    if (std.mem.eql(u8, args[1], "start")) {
+        return startContainer(allocator, init.io, args[2]);
+    }
+    if (std.mem.eql(u8, args[1], "kill")) {
+        const signal: u32 = if (args.len >= 4) try std.fmt.parseInt(u32, args[3], 10) else 15;
+        return killContainer(allocator, init.io, args[2], signal);
+    }
+    if (std.mem.eql(u8, args[1], "state")) {
+        return stateContainer(allocator, init.io, args[2]);
+    }
+    if (std.mem.eql(u8, args[1], "delete")) {
+        return deleteContainer(allocator, init.io, args[2]);
     }
 
     std.debug.print(USAGE, .{args[0]});
