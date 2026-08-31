@@ -1,0 +1,27 @@
+{
+  "ociVersion": "1.0.2",
+  "hostname": "zigcon",
+  "process": {
+    "args": [
+      "/bin/sh"
+    ],
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ],
+    "cwd": "/"
+  },
+  "root": {
+    "path": "rootfs"
+  },
+  "linux": {
+    "resources": {
+      "memory": {
+        "limit": null
+      },
+      "cpu": {
+        "quota": null,
+        "period": null
+      }
+    }
+  }
+}

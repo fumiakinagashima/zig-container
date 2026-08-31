@@ -2,6 +2,8 @@ const std = @import("std");
 
 const REGISTRY_HOST = "registry-1.docker.io";
 const MANIFEST_ACCEPT = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
+const MANIFEST_MAX_SIZE = 4 * 1024 * 1024;
+const BLOB_MAX_SIZE = 128 * 1024 * 1024;
 
 pub const Descriptor = struct {
     mediaType: []const u8,
@@ -52,6 +54,7 @@ fn httpGet(
     client: *std.http.Client,
     url: []const u8,
     extra_headers: []const std.http.Header,
+    max_size: usize,
 ) !HttpResult {
     const uri = try std.Uri.parse(url);
     var req = try client.request(.GET, uri, .{ .extra_headers = extra_headers });
@@ -72,7 +75,7 @@ fn httpGet(
 
     var transfer_buffer: [8192]u8 = undefined;
     const body_reader = response.reader(&transfer_buffer);
-    const body = try body_reader.allocRemaining(allocator, .limited(4 * 1024 * 1024));
+    const body = try body_reader.allocRemaining(allocator, .limited(max_size));
 
     return .{ .status = response.head.status, .content_type = content_type, .body = body };
 }
@@ -126,7 +129,7 @@ fn fetchToken(
         "{s}?service={s}&scope=repository:{s}:pull",
         .{ challenge.realm, challenge.service, repository },
     );
-    const result = try httpGet(allocator, client, url, &.{});
+    const result = try httpGet(allocator, client, url, &.{}, MANIFEST_MAX_SIZE);
     if (result.status != .ok) return error.TokenRequestFailed;
 
     const parsed = try std.json.parseFromSliceLeaky(
@@ -154,7 +157,7 @@ fn fetchManifestRaw(
     const result = try httpGet(allocator, client, url, &.{
         .{ .name = "Authorization", .value = auth_header },
         .{ .name = "Accept", .value = MANIFEST_ACCEPT },
-    });
+    }, MANIFEST_MAX_SIZE);
     if (result.status != .ok) return error.ManifestRequestFailed;
     return result;
 }
@@ -174,27 +177,74 @@ fn selectPlatform(index: ManifestIndex) !IndexEntry {
     return error.NoMatchingPlatform;
 }
 
-pub fn pullManifest(
+fn verifyDigest(body: []const u8, digest: []const u8) !void {
+    const prefix = "sha256:";
+    if (!std.mem.startsWith(u8, digest, prefix)) return error.UnsupportDigestAlgorithm;
+
+    var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &hash, .{});
+    const actual_hex = std.fmt.bytesToHex(hash, .lower);
+
+    if (!std.mem.eql(u8, &actual_hex, digest[prefix.len..])) return error.DigestMismatch;
+}
+
+pub const Session = struct {
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     repository: []const u8,
-    reference: []const u8,
-) !Manifest {
-    const challenge = try discoverChallenge(allocator, client);
-    const token = try fetchToken(allocator, client, challenge, repository);
+    token: []const u8,
 
-    var result = try fetchManifestRaw(allocator, client, repository, reference, token);
+    pub fn open(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        repository: []const u8,
+    ) !Session {
+        const challenge = try discoverChallenge(allocator, client);
+        const token = try fetchToken(allocator, client, challenge, repository);
+        return .{ .allocator = allocator, .client = client, .repository = repository, .token = token };
+    }
 
-    if (isIndexMediaType(result.content_type)) {
-        const index = try std.json.parseFromSliceLeaky(
-            ManifestIndex,
-            allocator,
+    pub fn pullManifest(self: Session, reference: []const u8) !Manifest {
+        var result = try fetchManifestRaw(self.allocator, self.client, self.repository, reference, self.token);
+
+        if (isIndexMediaType(result.content_type)) {
+            const index = try std.json.parseFromSliceLeaky(
+                ManifestIndex,
+                self.allocator,
+                result.body,
+                .{ .ignore_unknown_fields = true },
+            );
+            const entry = try selectPlatform(index);
+            result = try fetchManifestRaw(self.allocator, self.client, self.repository, entry.digest, self.token);
+            try verifyDigest(result.body, entry.digest);
+        }
+
+        return try std.json.parseFromSliceLeaky(
+            Manifest,
+            self.allocator,
             result.body,
             .{ .ignore_unknown_fields = true },
         );
-        const entry = try selectPlatform(index);
-        result = try fetchManifestRaw(allocator, client, repository, entry.digest, token);
     }
 
-    return try std.json.parseFromSliceLeaky(Manifest, allocator, result.body, .{ .ignore_unknown_fields = true });
-}
+    pub fn pullBlob(self: Session, digest: []const u8) ![]const u8 {
+        const url = try std.fmt.allocPrint(
+            self.allocator,
+            "https://{s}/v2/{s}/blobs/{s}",
+            .{ REGISTRY_HOST, self.repository, digest },
+        );
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.token});
+        const result = try httpGet(
+            self.allocator,
+            self.client,
+            url,
+            &.{ .{ .name = "Authorization", .value= auth_header }, },
+            BLOB_MAX_SIZE
+        );
+        if (result.status != .ok) return error.BlobRequestFailed;
+
+        try verifyDigest(result.body, digest);
+        
+        return result.body;
+    }
+};

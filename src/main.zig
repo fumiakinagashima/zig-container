@@ -6,6 +6,7 @@ const capabilities = @import("capabilities.zig");
 const seccomp = @import("seccomp.zig");
 const oci_config = @import("oci_config.zig");
 const oci_registry = @import("oci_registry.zig");
+const oci_image = @import("oci_image.zig");
 
 const SHM_KEY: i32 = 0x1234;
 const HOST_VETH_ADDR = [4]u8{ 10, 200, 0, 1 };
@@ -280,7 +281,11 @@ fn runInNewNamespace(allocator: std.mem.Allocator, bundle_dir: []const u8) !void
 
 }
 
-fn pullImage(allocator: std.mem.Allocator, io: std.Io, image_ref: []const u8) !void {
+fn pullImage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    image_ref: []const u8
+) !void {
     const sep = std.mem.lastIndexOfScalar(u8, image_ref, ':') orelse return error.InvalidImageRef;
     const repository = image_ref[0..sep];
     const reference = image_ref[sep + 1 ..];
@@ -288,18 +293,29 @@ fn pullImage(allocator: std.mem.Allocator, io: std.Io, image_ref: []const u8) !v
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
 
-    const manifest = try oci_registry.pullManifest(allocator, &client, repository, reference);
+    const session = try oci_registry.Session.open(allocator, &client, repository);
+    const manifest = try session.pullManifest(reference);
     std.debug.print(
         "config: {s} ({d} bytes, {s})\n",
         .{ manifest.config.digest, manifest.config.size, manifest.config.mediaType },
     );
 
+    const bundle_dir = try std.fmt.allocPrint(allocator, "pulled/{s}", .{repository});
+    const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/rootfs", .{bundle_dir});
+    const rootfs_dir = try std.Io.Dir.cwd().createDirPathOpen(io, rootfs_path, .{});
+    defer rootfs_dir.close(io);
+
     for (manifest.layers, 0..) |layer, i| {
+        const blob = try session.pullBlob(layer.digest);
+        try oci_image.extractLayer(io, rootfs_dir, layer, blob);
         std.debug.print(
-            "layer[{d}]: {s} ({d} bytes, {s})\n",
-            .{ i, layer.digest, layer.size, layer.mediaType },
+            "layer[{d}]: {s} extracted ({d} bytes, {s})\n",
+            .{ i, layer.digest, blob.len, layer.mediaType },
         );
     }
+    const config_blob = try session.pullBlob(manifest.config.digest);
+    try oci_image.writeBundleConfig(allocator, io, bundle_dir, config_blob);
+    std.debug.print("bundle ready: {s}\n", .{bundle_dir});
 }
 
 const USAGE = "usage: {s} run <bundle-dir> | pull <repository>:<reference>\n";
